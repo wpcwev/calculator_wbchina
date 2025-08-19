@@ -1,5 +1,11 @@
 import asyncio
 import os
+import csv
+from pathlib import Path
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -7,9 +13,24 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.filters import Command
 
-# ======== НАСТРОЙКИ ========
-API_TOKEN = os.getenv("TGTOKEN")  # задай токен в окружении
+
+# ================== КОНФИГ ==================
+API_TOKEN = os.getenv("TGTOKEN")  # токен бота
+
+
+# Группа, где менеджер(ы) кидают суммы (+/-)
+MANAGER_CHAT_ID = -1002759641457
+
+# Кто может вызывать отчёт/удаление (твоя учётка)
+ADMIN_CHAT_ID = [5682655968, 7400953101]  # список
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_CHAT_ID
+
+# Часовой пояс для "сегодня"
+REPORT_TZ = os.getenv("REPORT_TZ", "Europe/Moscow")
 
 # Ставки выплат партнёру (в руб./за 1 юань)
 PAY_NO_DISCOUNT_RUB_PER_CNY = 0.15   # без скидки
@@ -19,10 +40,15 @@ PAY_DISCOUNT_RUB_PER_CNY   = 0.10    # со скидкой
 CHECK_ADD_NO_DISCOUNT = 0.10
 CHECK_ADD_DISCOUNT    = 0.05
 
+DATA_DIR = Path("data")
+DB_PATH = DATA_DIR / "report.db"
+LOG_CSV = DATA_DIR / "log.csv"  # опционально (необязательный csv-лог)
+
+# ================== БОТ ==================
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ======== КЛАВИАТУРЫ ========
+# ================== КЛАВИАТУРЫ ==================
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Расчёт прибыли")],
@@ -35,7 +61,7 @@ cancel_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-# ======== СОСТОЯНИЯ ========
+# ================== FSM ДЛЯ РАСЧЁТА ==================
 class ProfitStates(StatesGroup):
     rate_ge_30000 = State()
     rate_10000_30000 = State()
@@ -44,7 +70,13 @@ class ProfitStates(StatesGroup):
     rate_lt_1000 = State()
     amounts_mixed = State()   # единый столбик сумм
 
-# ======== УТИЛИТЫ ========
+# ================== УТИЛИТЫ ==================
+def _tznow() -> datetime:
+    return datetime.now(ZoneInfo(REPORT_TZ))
+
+def _today() -> date:
+    return _tznow().date()
+
 def _parse_float(text: str):
     t = text.strip().replace(",", ".")
     try:
@@ -72,14 +104,10 @@ def _pick_rate_for_amount(cny_amount: float, rates: dict) -> float:
 
 def _parse_mixed_lines(text: str) -> tuple[list[float], list[float]]:
     """
-    Возвращает (без_скидки, со_скидкой).
-    Поддерживает:
-      +1500    -> без скидки
-      -2600    -> со скидкой
-      1500 ns  / 1500 no / 1500 без
-      2600 s   / 2600 со / 2600 скидка
-      просто 1500 -> по умолчанию БЕЗ скидки
-    Мусорные строки игнорируются.
+    Возвращает (без_скидки, со_скидкой) из форматов:
+      bs1000  | bs 1000  -> без скидки
+      s1000   | s 1000   -> со скидкой
+    Регистр не важен. Остальные строки игнорируются.
     """
     no_disc, disc = [], []
     for raw in text.replace("\t", "\n").splitlines():
@@ -87,53 +115,237 @@ def _parse_mixed_lines(text: str) -> tuple[list[float], list[float]]:
         if not line:
             continue
 
-        mark = None
-        if line.startswith("+"):
-            mark = "no"
-            line = line[1:].strip()
-        elif line.startswith("-"):
-            mark = "disc"
-            line = line[1:].strip()
-
+        # допускаем разделение пробелом: 'bs 1000' / 's 1000'
         parts = line.split()
-        num_part = parts[0] if parts else ""
-        try:
-            amount = float(num_part)
-        except ValueError:
-            filt = "".join(ch for ch in num_part if ch.isdigit() or ch in ".-")
-            try:
-                amount = float(filt)
-            except ValueError:
-                continue
+        token = "".join(parts)  # склеиваем, чтобы 'bs 1000' -> 'bs1000'
 
-        if amount <= 0:
+        def parse_amount(s: str) -> float | None:
+            # вытащим число из хвоста токена
+            num = "".join(ch for ch in s if (ch.isdigit() or ch in "."))
+            if not num:
+                return None
+            try:
+                v = float(num)
+                return v if v > 0 else None
+            except ValueError:
+                return None
+
+        if token.startswith("bs"):
+            val = parse_amount(token[2:])
+            if val is not None:
+                no_disc.append(val)
             continue
 
-        if mark is None and len(parts) > 1:
-            tag = parts[1]
-            if tag in ("s", "so", "скидка", "со", "с", "disc", "d"):
-                mark = "disc"
-            elif tag in ("ns", "no", "без", "b", "nd"):
-                mark = "no"
+        if token.startswith("s"):
+            val = parse_amount(token[1:])
+            if val is not None:
+                disc.append(val)
+            continue
 
-        if mark == "disc":
-            disc.append(amount)
-        else:
-            no_disc.append(amount)
+        # всё остальное теперь игнорируем
     return no_disc, disc
 
-# ======== ХЭНДЛЕРЫ ========
+
+# ================== БД ==================
+async def init_db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS entries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            is_discount INTEGER NOT NULL, -- 0 без скидки, 1 со скидкой
+            chat_id INTEGER NOT NULL,
+            msg_id INTEGER NOT NULL,
+            sender_id INTEGER
+        )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entries_msg ON entries(chat_id, msg_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entries_sender_date ON entries(sender_id, date)")
+        await db.commit()
+
+async def replace_message_entries(chat_id: int, msg_id: int, sender_id: int | None,
+                                  no_list: list[float], disc_list: list[float]):
+    """Полностью заменяет записи, привязанные к (chat_id,msg_id) на новые значения."""
+    now = _tznow()
+    d = _today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM entries WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+        for a in no_list:
+            await db.execute(
+                "INSERT INTO entries(ts,date,amount,is_discount,chat_id,msg_id,sender_id) VALUES(?,?,?,?,?,?,?)",
+                (now.isoformat(), d, float(a), 0, chat_id, msg_id, sender_id)
+            )
+        for a in disc_list:
+            await db.execute(
+                "INSERT INTO entries(ts,date,amount,is_discount,chat_id,msg_id,sender_id) VALUES(?,?,?,?,?,?,?)",
+                (now.isoformat(), d, float(a), 1, chat_id, msg_id, sender_id)
+            )
+        await db.commit()
+
+async def clear_today() -> tuple[int, float, float]:
+    """Удаляет все записи за текущие сутки. Возвращает (count, sum_no, sum_disc)."""
+    d = _today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT 
+              COUNT(*),
+              COALESCE(SUM(CASE WHEN is_discount=0 THEN amount END),0),
+              COALESCE(SUM(CASE WHEN is_discount=1 THEN amount END),0)
+            FROM entries WHERE date=?
+        """, (d,)) as cur:
+            row = await cur.fetchone()
+        cnt, sum_no, sum_disc = row or (0, 0.0, 0.0)
+        await db.execute("DELETE FROM entries WHERE date=?", (d,))
+        await db.commit()
+    return int(cnt), float(sum_no), float(sum_disc)
+
+# --- вместо delete_by_msg_id ---
+async def delete_by_msg_id(chat_id: int, msg_id: int) -> tuple[int, float, float]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT 
+              COUNT(*),
+              COALESCE(SUM(CASE WHEN is_discount=0 THEN amount END),0),
+              COALESCE(SUM(CASE WHEN is_discount=1 THEN amount END),0)
+            FROM entries WHERE chat_id=? AND msg_id=?
+        """, (chat_id, msg_id)) as cur:
+            row = await cur.fetchone()
+        cnt, sum_no, sum_disc = (row or (0, 0.0, 0.0))
+        await db.execute("DELETE FROM entries WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+        await db.commit()
+    return int(cnt), float(sum_no), float(sum_disc)
+
+
+# --- вместо undo_last_for_sender ---
+async def undo_last_for_sender(sender_id: int) -> tuple[bool, int, float, float, int]:
+    d = _today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT msg_id
+            FROM entries
+            WHERE sender_id=? AND date=?
+            ORDER BY ts DESC
+            LIMIT 1
+        """, (sender_id, d)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False, 0, 0.0, 0.0, 0
+        msg_id = int(row[0])
+
+        async with db.execute("""
+            SELECT 
+              COUNT(*),
+              COALESCE(SUM(CASE WHEN is_discount=0 THEN amount END),0),
+              COALESCE(SUM(CASE WHEN is_discount=1 THEN amount END),0)
+            FROM entries WHERE msg_id=? AND date=? AND sender_id=?
+        """, (msg_id, d, sender_id)) as cur2:
+            row2 = await cur2.fetchone()
+        cnt, sum_no, sum_disc = (row2 or (0, 0.0, 0.0))
+
+        await db.execute("DELETE FROM entries WHERE msg_id=? AND date=? AND sender_id=?", (msg_id, d, sender_id))
+        await db.commit()
+    return True, int(cnt), float(sum_no), float(sum_disc), msg_id
+
+
+# --- вместо aggregate_for_day ---
+async def aggregate_for_day(day: date) -> dict:
+    totals = {
+        "sum_no": 0.0, "sum_disc": 0.0, "total_cny": 0.0,
+        "payout_no": 0.0, "payout_disc": 0.0, "payout_total": 0.0
+    }
+    d = day.isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT
+              COALESCE(SUM(CASE WHEN is_discount=0 THEN amount END),0),
+              COALESCE(SUM(CASE WHEN is_discount=1 THEN amount END),0)
+            FROM entries WHERE date=?
+        """, (d,)) as cur:
+            row = await cur.fetchone()
+        sum_no, sum_disc = row or (0.0, 0.0)
+
+    totals["sum_no"] = float(sum_no)
+    totals["sum_disc"] = float(sum_disc)
+    totals["total_cny"] = totals["sum_no"] + totals["sum_disc"]
+    totals["payout_no"] = totals["sum_no"] * PAY_NO_DISCOUNT_RUB_PER_CNY
+    totals["payout_disc"] = totals["sum_disc"] * PAY_DISCOUNT_RUB_PER_CNY
+    totals["payout_total"] = totals["payout_no"] + totals["payout_disc"]
+    return totals
+
+
+def format_daily_report(day: date, totals: dict) -> str:
+    return (
+        f"<b>Ежедневный отчёт за {day.strftime('%d.%m.%Y')}</b>\n\n"
+        f"<b>Суммы в юанях:</b>\n"
+        f"Без скидки: {_format_cny(totals['sum_no'])}\n"
+        f"Со скидкой: {_format_cny(totals['sum_disc'])}\n"
+        f"Всего: <b>{_format_cny(totals['total_cny'])}</b>\n\n"
+        f"<b>Выплаты партнёру:</b>\n"
+        f"Без скидки: {_format_rub(totals['payout_no'])}\n"
+        f"Со скидкой: {_format_rub(totals['payout_disc'])}\n"
+        f"Итого к выплате: <b>{_format_rub(totals['payout_total'])}</b>\n"
+    )
+# === Команды в ЛС и в группе ===
+@dp.message(Command("myid"))
+async def myid(message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    await message.answer(f"user_id: <code>{uid}</code>\nchat_id: <code>{message.chat.id}</code>")
+
+@dp.message(Command("clear_today"))
+async def clear_today_cmd(message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    if uid not in ADMIN_CHAT_ID and message.chat.id not in ADMIN_CHAT_ID:
+        return
+
+    cnt, sum_no, sum_disc = await clear_today()
+    await message.answer(
+        f"Очищено за сегодня: {cnt} записей.\n"
+        f"Было: без скидки {_format_cny(sum_no)}, со скидкой {_format_cny(sum_disc)}."
+    )
+
+@dp.message(Command("report_today"))
+async def report_today(message: Message):
+    # разрешаем админу из любого чата
+    uid = message.from_user.id if message.from_user else 0
+    if uid not in ADMIN_CHAT_ID and message.chat.id not in ADMIN_CHAT_ID:
+        return
+    totals = await aggregate_for_day(_today())
+    await message.answer(format_daily_report(_today(), totals))
+
+# === Команды именно в группе менеджера ===
+@dp.message(F.chat.id == MANAGER_CHAT_ID, Command("undo"))
+async def undo_cmd(message: Message):
+    if not message.from_user:
+        return
+    ok, cnt, sum_no, sum_disc, msg_id = await undo_last_for_sender(message.from_user.id)
+    if not ok:
+        await message.reply("Нечего отменять за сегодня.")
+        return
+    await message.reply(
+        f"Отменено (msg_id={msg_id}): {cnt} строк. "
+        f"Минус: без скидки {_format_cny(sum_no)}, со скидкой {_format_cny(sum_disc)}."
+    )
+
+# ================== ХЭНДЛЕРЫ: ОБЩЕЕ МЕНЮ ==================
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Привет! Этот бот считает ежедневную выплату партнёру по обмену. Выбери действие:",
-                         reply_markup=main_kb)
+    await message.answer(
+        "Привет! Этот бот считает выплаты партнёру и собирает обмены из группы менеджера.\n"
+        "Меню — ниже.",
+        reply_markup=main_kb
+    )
 
 @dp.message(F.text == "🚫 Отмена")
 async def cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено. Возвращаю в главное меню.", reply_markup=main_kb)
 
+# ================== ХЭНДЛЕРЫ: РАСЧЁТ ПО КУРСАМ ==================
 @dp.message(F.text == "📊 Расчёт прибыли")
 async def start_profit_calc(message: Message, state: FSMContext):
     await state.clear()
@@ -206,13 +418,17 @@ async def rate_lt_1000(message: Message, state: FSMContext):
     await message.answer(
         "Введите <b>в ОДИН столбик</b> суммы юаней.\n"
         "Отмечайте тип заявки:\n"
-        "• <b>+1500</b> — без скидки\n"
-        "• <b>-2600</b> — со скидкой\n"
-        "Также можно: <code>1500 ns</code> (без) или <code>2600 s</code> (со).\n"
-        "Пример:\n<code>\n+1500\n-900\n+12000\n-2600\n</code>",
+        "• <b>bs1500</b> — без скидки\n"
+        "• <b>s2600</b> — со скидкой\n"
+        "Пример:\n<code>\nbs1500\ns900\nbs12000\ns2600\n</code>",
         reply_markup=cancel_kb
     )
     await state.set_state(ProfitStates.amounts_mixed)
+
+@dp.message(F.text == "/myid")
+async def myid(message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    await message.answer(f"user_id: <code>{uid}</code>\nchat_id: <code>{message.chat.id}</code>")
 
 @dp.message(ProfitStates.amounts_mixed)
 async def amounts_mixed(message: Message, state: FSMContext):
@@ -232,6 +448,18 @@ async def amounts_mixed(message: Message, state: FSMContext):
     payout_disc = sum_disc * PAY_DISCOUNT_RUB_PER_CNY
     payout_total = payout_no + payout_disc
 
+    # (опционально) CSV-лог одного расчёта:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOG_CSV.exists():
+        with LOG_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["ts_iso","date","sum_no","sum_disc","total_cny","payout_no","payout_disc","payout_total"])
+    with LOG_CSV.open("a", newline="", encoding="utf-8") as f:
+        now = _tznow()
+        w = csv.writer(f, delimiter=";")
+        w.writerow([now.isoformat(), _today().isoformat(), f"{sum_no:.6f}", f"{sum_disc:.6f}",
+                    f"{total_cny:.6f}", f"{payout_no:.6f}", f"{payout_disc:.6f}", f"{payout_total:.6f}"])
+
     # Проверочные строки
     lines_check_no = []
     for a in no_list:
@@ -246,7 +474,7 @@ async def amounts_mixed(message: Message, state: FSMContext):
         lines_check_disc.append(f"{a:,.2f} ¥ × ({r:.4f} + {CHECK_ADD_DISCOUNT:.2f}) = {_format_rub(rub)}".replace(",", " "))
 
     msg = []
-    msg.append("<b>Итоги за день</b>\n")
+    msg.append("<b>Итоги за день (ввод из диалога)</b>\n")
     msg.append("<b>Курсы (₽/¥):</b>")
     msg.append(f"≥ 30000 ¥: <b>{rates['ge_30000']}</b>")
     msg.append(f"10000–30000 ¥: <b>{rates['r_10000_30000']}</b>")
@@ -271,17 +499,99 @@ async def amounts_mixed(message: Message, state: FSMContext):
 
     text = "\n".join(msg)
     if len(text) > 3900:
-        cut_idx = msg.index("<b>Проверьте суммы в рублях (без скидки):</b>")
+        cut_label = "<b>Проверьте суммы в рублях (без скидки):</b>"
+        cut_idx = msg.index(cut_label) if cut_label in msg else len(msg)
         text = "\n".join(msg[:cut_idx]) + "\n\n<i>Список проверочных расчётов слишком длинный. Уменьшите количество строк.</i>"
 
     await message.answer(text, reply_markup=main_kb)
     await state.clear()
 
-# ======== ЗАПУСК ========
+# ================== ГРУППА МЕНЕДЖЕРА: НОВЫЕ СООБЩЕНИЯ ==================
+@dp.message(F.chat.id == MANAGER_CHAT_ID, F.text)
+async def manager_group_listener(message: Message):
+    no_list, disc_list = _parse_mixed_lines(message.text)
+    if not no_list and not disc_list:
+        return  # игнорим нерелевантные сообщения
+
+    await replace_message_entries(
+        chat_id=message.chat.id,
+        msg_id=message.message_id,
+        sender_id=message.from_user.id if message.from_user else None,
+        no_list=no_list,
+        disc_list=disc_list
+    )
+
+    await message.reply(
+        f"Принято: +{len(no_list)} без скидки, -{len(disc_list)} со скидкой. "
+        f"Сумма: {_format_cny(sum(no_list) + sum(disc_list))}"
+    )
+
+# ================== ГРУППА МЕНЕДЖЕРА: РЕДАКТИРОВАННЫЕ СООБЩЕНИЯ ==================
+@dp.edited_message(F.chat.id == MANAGER_CHAT_ID, F.text)
+async def manager_group_edited(message: Message):
+    no_list, disc_list = _parse_mixed_lines(message.text)
+    # Если отредактировали в нерелевантное — просто удалим прежние записи по msg_id
+    await replace_message_entries(
+        chat_id=message.chat.id,
+        msg_id=message.message_id,
+        sender_id=message.from_user.id if message.from_user else None,
+        no_list=no_list,
+        disc_list=disc_list
+    )
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=f"Обновлено для msg_id={message.message_id}: +{len(no_list)}, -{len(disc_list)}."
+    )
+
+# ================== КОМАНДЫ: ОТЧЁТ/УДАЛЕНИЕ/ОТМЕНА ==================
+def _is_admin_context(message: Message) -> bool:
+    uid = message.from_user.id if message.from_user else 0
+    return uid in ADMIN_CHAT_ID or message.chat.id in ADMIN_CHAT_ID
+
+
+@dp.message(F.text == "/report_today")
+async def report_today(message: Message):
+    if not _is_admin_context(message):
+        return
+    totals = await aggregate_for_day(_today())
+    txt = format_daily_report(_today(), totals)
+    await message.answer(txt)
+
+@dp.message(F.text.startswith("/delete"))
+async def delete_msg(message: Message):
+    if not _is_admin_context(message):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: <code>/delete &lt;msg_id&gt;</code>")
+        return
+    msg_id = int(parts[1])
+    cnt, sum_no, sum_disc = await delete_by_msg_id(MANAGER_CHAT_ID, msg_id)
+    await message.answer(
+        f"Удалено {cnt} строк по msg_id={msg_id}. "
+        f"Снято: без скидки {_format_cny(sum_no)}, со скидкой {_format_cny(sum_disc)}."
+    )
+
+@dp.message(F.text == "/undo")
+async def undo_cmd(message: Message):
+    # Разрешаем только из группы менеджера и только автору отменять своё
+    if message.chat.id != MANAGER_CHAT_ID or not message.from_user:
+        return
+    ok, cnt, sum_no, sum_disc, msg_id = await undo_last_for_sender(message.from_user.id)
+    if not ok:
+        await message.reply("Нечего отменять за сегодня.")
+        return
+    await message.reply(
+        f"Отменено (msg_id={msg_id}): {cnt} строк. "
+        f"Минус: без скидки {_format_cny(sum_no)}, со скидкой {_format_cny(sum_disc)}."
+    )
+
+# ================== main() ==================
 async def main():
     if not API_TOKEN:
         raise RuntimeError("Не задан токен в переменной окружения TGTOKEN_TEST")
-    # снимаем возможный webhook, чтобы не было Conflict
+    await init_db()
+    # убрать возможный webhook, чтобы не было конфликтов при polling
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
