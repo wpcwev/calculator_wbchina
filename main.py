@@ -15,7 +15,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command
 
-# ================== КОНФИГ ==================
+# ================== КОНФИГ ===================
 API_TOKEN = os.getenv("TGTOKEN")  # токен бота
 
 # Группа, где менеджер(ы) кидают суммы (+/-)
