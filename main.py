@@ -15,16 +15,14 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command
 
-
 # ================== КОНФИГ ==================
 API_TOKEN = os.getenv("TGTOKEN")  # токен бота
-
 
 # Группа, где менеджер(ы) кидают суммы (+/-)
 MANAGER_CHAT_ID = -1002759641457
 
 # Кто может вызывать отчёт/удаление (твоя учётка)
-ADMIN_CHAT_ID = [5682655968, 7400953101]  # список
+ADMIN_CHAT_ID = [5682655968, 7400953103]  # список
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_CHAT_ID
